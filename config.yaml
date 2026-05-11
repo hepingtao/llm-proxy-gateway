@@ -3,26 +3,20 @@ log_dir: logs
 max_log_size_mb: 100
 
 # Provider-level defaults (inherited by models, can be overridden per-model)
+# All model keys use provider_name/model_name format internally (auto-prefixed by code).
+#
+# API 格式: anthropic-messages, openai-chat-completions, openai-responses
+#
+# base_url 两种形式:
+#   1. 字符串 + supported_formats 列表 → 同一 URL 支持多种格式，按请求格式路由
+#      supported_formats 必填，如不匹配则按优先级降级转换
+#   2. 字典 {openai-chat-completions: ..., anthropic-messages: ...} → 不同格式走不同 URL
+#      如不匹配则按优先级降级转换
 providers:
-  anthropic:
-    base_url: "https://api.anthropic.com"
-    api_version: "2023-06-01"
-    api_key_env: CLAUDE_API_KEY
-    models:
-      claude-sonnet-4-20250514: {}
-      claude-opus-4-20250514: {}
-
-  openai:
-    base_url: "https://api.openai.com"
-    api_key_env: OPENAI_API_KEY
-    models:
-      gpt-4o: {}
-      gpt-4o-mini: {}
-
   deepseek:
     base_url:
-      openai: "https://api.deepseek.com"
-      anthropic: "https://api.deepseek.com/anthropic"
+      openai-chat-completions: "https://api.deepseek.com"
+      anthropic-messages: "https://api.deepseek.com/anthropic"
     api_key_env: DEEPSEEK_API_KEY
     models:
       deepseek-v4-flash: {}
@@ -31,19 +25,81 @@ providers:
 
   qwen:
     base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"
+    supported_formats: [anthropic-messages]
     api_key_env: QWEN_API_KEY
     models:
       qwen3.6-plus: {}
 
-  qwen-coder:
+  vllm:
     base_url: "http://192.168.31.20:8000"
-    api_key_env: QWEN_API_KEY
+    supported_formats: [openai-chat-completions, anthropic-messages]
+    api_key_env: VLLM_API_KEY
     models:
       Qwen3.6-Coder: {}
 
-# Default model when client doesn't specify
-default_model: Qwen3.6-Coder
+  mimo:
+    base_url:
+      openai-chat-completions: "https://token-plan-cn.xiaomimimo.com"
+      anthropic-messages: "https://token-plan-cn.xiaomimimo.com/anthropic"
+    api_key_env: MIMO_API_KEY
+    models:
+      mimo-v2.5-pro: {}
+      mimo-v2.5: {}
 
-# Model alias mapping (downstream name -> actual model name)
+# Default model when client doesn't specify
+default_model: vllm/Qwen3.6-Coder
+
+# Model alias mapping
+# - Simple string aliases: alias_name -> provider/model_name (direct routing)
+# - Dict aliases (with cascade): configurable multi-model auto-cascade routing
+#
+# All model references use provider_name/model_name format to avoid ambiguity
+# when different providers host models with the same name.
 aliases:
-  cc-coder: Qwen3.6-Coder
+  qwen-coder:
+    cascade:
+      - model: vllm/Qwen3.6-Coder # primary — local, fast
+      - model: mimo/mimo-v2.5-pro # mimo fallback
+      - model: deepseek/deepseek-v4-flash # cloud cheap
+      - model: deepseek/deepseek-v4-pro # cloud most capable
+    quality_checks:
+      min_response_length: 10
+      check_empty: true
+      check_truncation: true
+    max_total_timeout: 180.0
+
+  codex:
+    cascade:
+      - model: mimo/mimo-v2.5-pro
+      - model: deepseek/deepseek-v4-flash
+      - model: deepseek/deepseek-v4-pro
+      - model: vllm/Qwen3.6-Coder
+    quality_checks:
+      min_response_length: 10
+      check_empty: true
+      check_truncation: true
+    max_total_timeout: 180.0
+
+  claude:
+    cascade:
+      - model: mimo/mimo-v2.5-pro
+      - model: deepseek/deepseek-v4-flash
+      - model: deepseek/deepseek-v4-pro
+      - model: vllm/Qwen3.6-Coder
+    quality_checks:
+      min_response_length: 10
+      check_empty: true
+      check_truncation: true
+    max_total_timeout: 180.0
+
+  auto:
+    cascade:
+      - model: mimo/mimo-v2.5-pro # mimo fallback
+      - model: deepseek/deepseek-v4-flash # cloud cheap
+      - model: deepseek/deepseek-v4-pro # cloud most capable
+      - model: vllm/Qwen3.6-Coder # primary — local, fast
+    quality_checks:
+      min_response_length: 10
+      check_empty: true
+      check_truncation: true
+    max_total_timeout: 180.0
