@@ -175,6 +175,14 @@ def _set_proxy_info(request: Request, model_name: str, upstream: dict, upstream_
     }
 
 
+def _path_for_format(request_format: str) -> str:
+    return {
+        RequestFormat.ANTHROPIC_MESSAGES.value: "/v1/messages",
+        RequestFormat.OPENAI_CHAT_COMPLETIONS.value: "/v1/chat/completions",
+        RequestFormat.OPENAI_RESPONSES.value: "/v1/responses",
+    }.get(request_format, "")
+
+
 def _cascade_alias_for(model_name: str) -> str | None:
     """Return the cascade alias name if model_name should use cascade routing, else None."""
     alias = model_config.get_cascade_alias_name(model_name)
@@ -550,7 +558,9 @@ async def create_response(req: ResponsesRequest, request: Request):
             actual_format = upstream["actual_format"]
             conv_id = logger.log_request(f"{cascade_alias}/{cascade_model}", upstream["upstream_model"],
                                         request_data, client_id, upstream["base_url"])
-            _set_proxy_info(request, model_name, upstream, "/v1/chat/completions")
+            _set_proxy_info(
+                request, model_name, upstream, _path_for_format(actual_format)
+            )
 
             async def event_stream():
                 has_error = False
@@ -580,7 +590,12 @@ async def create_response(req: ResponsesRequest, request: Request):
         if upstream is None:
             return result
 
-        _set_proxy_info(request, model_name, upstream, "/v1/chat/completions")
+        _set_proxy_info(
+            request,
+            model_name,
+            upstream,
+            _path_for_format(upstream["actual_format"]),
+        )
         request.state._proxy_info["usage"] = _response_usage(result)
         request.state._proxy_info["stop"] = "stop"
         resp = JSONResponse(content=result)
@@ -597,7 +612,7 @@ async def create_response(req: ResponsesRequest, request: Request):
     client_id = request.client.host if request.client else "unknown"
     request_data = req.model_dump(exclude_none=True)
     conv_id = logger.log_request(model_name, upstream["upstream_model"], request_data, client_id, upstream["base_url"])
-    _set_proxy_info(request, model_name, upstream, "/v1/chat/completions")
+    _set_proxy_info(request, model_name, upstream, _path_for_format(actual_format))
 
     if req.stream:
         async def event_stream():
@@ -619,10 +634,6 @@ async def create_response(req: ResponsesRequest, request: Request):
     try:
         result = await call_with_conversion(req, request_format.value, actual_format, upstream)
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        with open("D:/work/gerrit/X/proxy_traceback.log", "a") as f:
-            f.write(tb + "\n" + "="*60 + "\n")
         status_code, error_payload = _format_upstream_error(e, model_name, upstream, str(request.url), request_format)
         logger.log_response(model_name, upstream["upstream_model"], conv_id, {"error": error_payload["error"]})
         request.state._proxy_info["stop"] = f"error_{status_code}"

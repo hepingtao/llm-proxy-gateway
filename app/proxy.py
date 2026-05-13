@@ -92,7 +92,9 @@ def _openai_tool_to_anthropic(tool: dict) -> dict:
         return {
             "name": function.get("name", ""),
             "description": function.get("description", ""),
-            "input_schema": function.get("parameters", {"type": "object", "properties": {}}),
+            "input_schema": function.get(
+                "parameters", {"type": "object", "properties": {}}
+            ),
         }
     return tool
 
@@ -105,22 +107,63 @@ def _anthropic_tool_to_openai(tool: dict) -> dict:
         "function": {
             "name": tool.get("name", ""),
             "description": tool.get("description", ""),
-            "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+            "parameters": tool.get(
+                "input_schema", {"type": "object", "properties": {}}
+            ),
         },
     }
 
 
-def _responses_tool_to_chat(tool: dict) -> dict:
-    if tool.get("type") == "function" and "function" not in tool:
-        return {
-            "type": "function",
-            "function": {
-                "name": tool.get("name", ""),
-                "description": tool.get("description", ""),
-                "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
-            },
-        }
-    return tool
+def _responses_tool_to_chat(tool: dict) -> dict | None:
+    """Convert a single Responses-API tool to Chat-Completions format.
+
+    Returns None for tool types that OpenAI-compatible upstreams cannot handle
+    (e.g. ``web_search``, ``image_generation``, ``custom``).  ``namespace``
+    tools are NOT handled here — use ``_responses_tools_to_chat`` which
+    recursively expands their sub-tools.
+    """
+    tool_type = tool.get("type")
+    if tool_type == "function":
+        if "function" not in tool:
+            # Flat Responses-API format → wrap into Chat-Completions format
+            return {
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get(
+                        "parameters", {"type": "object", "properties": {}}
+                    ),
+                },
+            }
+        # Already in Chat-Completions nested format
+        return tool
+    # All other types (custom, web_search, image_generation, namespace, …)
+    # are Codex-specific and not supported by standard OpenAI-compatible APIs.
+    return None
+
+
+def _responses_tools_to_chat(tools: list[dict]) -> list[dict]:
+    """Convert a list of Responses-API tools to Chat-Completions format.
+
+    * ``function`` tools are wrapped into ``{type, function: {…}}`` form.
+    * ``namespace`` tools are expanded: their nested sub-tools are processed
+      recursively so callers in MCP namespaces remain available.
+    * All other types (``web_search``, ``image_generation``, ``custom``, …)
+      are silently dropped because standard OpenAI-compatible upstreams do
+      not understand them.
+    """
+    result: list[dict] = []
+    for tool in tools:
+        if tool.get("type") == "namespace":
+            # Expand sub-tools from the namespace group
+            sub_tools = tool.get("tools") or []
+            result.extend(_responses_tools_to_chat(sub_tools))
+        else:
+            converted = _responses_tool_to_chat(tool)
+            if converted is not None:
+                result.append(converted)
+    return result
 
 
 def _chat_tool_to_responses(tool: dict) -> dict:
@@ -130,7 +173,9 @@ def _chat_tool_to_responses(tool: dict) -> dict:
             "type": "function",
             "name": function.get("name", ""),
             "description": function.get("description", ""),
-            "parameters": function.get("parameters", {"type": "object", "properties": {}}),
+            "parameters": function.get(
+                "parameters", {"type": "object", "properties": {}}
+            ),
         }
     return tool
 
@@ -180,14 +225,16 @@ def _anthropic_content_to_openai(content: Any) -> tuple[Any, list[dict] | None]:
         if block_type in ("text", "thinking"):
             text_parts.append(block.get("text") or block.get("thinking") or "")
         elif block_type == "tool_use":
-            tool_calls.append({
-                "id": block.get("id") or _response_id("call"),
-                "type": "function",
-                "function": {
-                    "name": block.get("name", ""),
-                    "arguments": _json_dumps(block.get("input") or {}),
-                },
-            })
+            tool_calls.append(
+                {
+                    "id": block.get("id") or _response_id("call"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": _json_dumps(block.get("input") or {}),
+                    },
+                }
+            )
 
     return "".join(text_parts), (tool_calls or None)
 
@@ -209,19 +256,27 @@ def _openai_message_to_anthropic(message: dict) -> list[dict] | str:
         function = tool_call.get("function") or {}
         arguments = function.get("arguments") or "{}"
         try:
-            tool_input = json.loads(arguments) if isinstance(arguments, str) else arguments
+            tool_input = (
+                json.loads(arguments) if isinstance(arguments, str) else arguments
+            )
         except json.JSONDecodeError:
             tool_input = {"arguments": arguments}
-        blocks.append({
-            "type": "tool_use",
-            "id": tool_call.get("id") or _response_id("call"),
-            "name": function.get("name", ""),
-            "input": tool_input or {},
-        })
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": tool_call.get("id") or _response_id("call"),
+                "name": function.get("name", ""),
+                "input": tool_input or {},
+            }
+        )
 
     if not blocks:
         return ""
-    return blocks if any(block.get("type") != "text" for block in blocks) else blocks[0]["text"]
+    return (
+        blocks
+        if any(block.get("type") != "text" for block in blocks)
+        else blocks[0]["text"]
+    )
 
 
 def _chat_messages_to_anthropic(messages: list[Any]) -> tuple[str | None, list[dict]]:
@@ -236,19 +291,27 @@ def _chat_messages_to_anthropic(messages: list[Any]) -> tuple[str | None, list[d
             system_parts.append(_extract_text(message.get("content")))
             continue
         if role == "tool":
-            anthropic_messages.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": message.get("tool_call_id", ""),
-                    "content": message.get("content") or "",
-                }],
-            })
+            anthropic_messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": message.get("tool_call_id", ""),
+                            "content": message.get("content") or "",
+                        }
+                    ],
+                }
+            )
             continue
         if role not in ("user", "assistant"):
             role = "user"
-        anthropic_messages.append({"role": role, "content": _openai_message_to_anthropic(message)})
-    return ("\n\n".join(part for part in system_parts if part) or None), anthropic_messages
+        anthropic_messages.append(
+            {"role": role, "content": _openai_message_to_anthropic(message)}
+        )
+    return (
+        "\n\n".join(part for part in system_parts if part) or None
+    ), anthropic_messages
 
 
 def _anthropic_messages_to_chat(messages: list[Any], system: Any = None) -> list[dict]:
@@ -260,9 +323,37 @@ def _anthropic_messages_to_chat(messages: list[Any], system: Any = None) -> list
     for raw_message in messages:
         message = _dump(raw_message)
         role = message.get("role", "user")
+        content_blocks = message.get("content")
+        if role == "user" and isinstance(content_blocks, list):
+            text_parts: list[str] = []
+            tool_messages: list[dict] = []
+            for block in content_blocks:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_result":
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": block.get("tool_use_id", ""),
+                            "content": _extract_text(block.get("content")),
+                        }
+                    )
+                elif block.get("type") in ("text", "input_text", "output_text"):
+                    text_parts.append(block.get("text") or "")
+            if tool_messages:
+                text = "".join(text_parts)
+                if text:
+                    chat_messages.append({"role": role, "content": text})
+                chat_messages.extend(tool_messages)
+                continue
+
         content, tool_calls = _anthropic_content_to_openai(message.get("content"))
         if role == "assistant" and tool_calls:
-            chat_message = {"role": "assistant", "content": content or None, "tool_calls": tool_calls}
+            chat_message = {
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": tool_calls,
+            }
         else:
             chat_message = {"role": role, "content": content}
         chat_messages.append(chat_message)
@@ -287,26 +378,39 @@ def _responses_input_to_chat_messages(req: ResponsesRequest) -> list[dict]:
             content = item.get("content", "")
             messages.append({"role": role, "content": _extract_text(content)})
         elif item_type == "function_call_output":
-            messages.append({
-                "role": "tool",
-                "tool_call_id": item.get("call_id") or item.get("id", ""),
-                "content": item.get("output", ""),
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id") or item.get("id", ""),
+                    "content": item.get("output", ""),
+                }
+            )
         elif item_type == "function_call":
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": item.get("call_id") or item.get("id") or _response_id("call"),
-                    "type": "function",
-                    "function": {
-                        "name": item.get("name", ""),
-                        "arguments": item.get("arguments", "{}"),
-                    },
-                }],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": item.get("call_id")
+                            or item.get("id")
+                            or _response_id("call"),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name", ""),
+                                "arguments": item.get("arguments", "{}"),
+                            },
+                        }
+                    ],
+                }
+            )
         else:
-            messages.append({"role": item.get("role", "user"), "content": _extract_text(item.get("content", item))})
+            messages.append(
+                {
+                    "role": item.get("role", "user"),
+                    "content": _extract_text(item.get("content", item)),
+                }
+            )
     return messages
 
 
@@ -391,18 +495,29 @@ def _responses_to_chat_body(req: ResponsesRequest, upstream: dict) -> dict:
     elif upstream.get("reasoning_effort"):
         body["reasoning_effort"] = upstream["reasoning_effort"]
     if req.tools:
-        body["tools"] = [_responses_tool_to_chat(tool) for tool in req.tools]
+        converted_tools = _responses_tools_to_chat(req.tools)
+        if converted_tools:
+            body["tools"] = converted_tools
     if req.tool_choice:
         body["tool_choice"] = req.tool_choice
     return body
 
 
 def _responses_to_anthropic_body(req: ResponsesRequest, upstream: dict) -> dict:
-    chat_req = OpenAIRequest(**_responses_to_chat_body(req, {"upstream_model": req.model or upstream["upstream_model"]}))
+    chat_req = OpenAIRequest(
+        **_responses_to_chat_body(
+            req, {"upstream_model": req.model or upstream["upstream_model"]}
+        )
+    )
     return _chat_to_anthropic_body(chat_req, upstream)
 
 
-def _request_to_body(req: ClaudeRequest | OpenAIRequest | ResponsesRequest, source_format: str, target_format: str, upstream: dict) -> dict:
+def _request_to_body(
+    req: ClaudeRequest | OpenAIRequest | ResponsesRequest,
+    source_format: str,
+    target_format: str,
+    upstream: dict,
+) -> dict:
     if source_format == target_format == RequestFormat.ANTHROPIC_MESSAGES.value:
         return _base_anthropic_body(req, upstream)  # type: ignore[arg-type]
     if source_format == target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
@@ -412,17 +527,31 @@ def _request_to_body(req: ClaudeRequest | OpenAIRequest | ResponsesRequest, sour
         body["model"] = upstream["upstream_model"]
         return body
 
-    if source_format == RequestFormat.ANTHROPIC_MESSAGES.value and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
+    if (
+        source_format == RequestFormat.ANTHROPIC_MESSAGES.value
+        and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
+    ):
         return _anthropic_to_chat_body(req, upstream)  # type: ignore[arg-type]
-    if source_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value and target_format == RequestFormat.ANTHROPIC_MESSAGES.value:
+    if (
+        source_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
+        and target_format == RequestFormat.ANTHROPIC_MESSAGES.value
+    ):
         return _chat_to_anthropic_body(req, upstream)  # type: ignore[arg-type]
-    if source_format == RequestFormat.OPENAI_RESPONSES.value and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
+    if (
+        source_format == RequestFormat.OPENAI_RESPONSES.value
+        and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
+    ):
         return _responses_to_chat_body(req, upstream)  # type: ignore[arg-type]
-    if source_format == RequestFormat.OPENAI_RESPONSES.value and target_format == RequestFormat.ANTHROPIC_MESSAGES.value:
+    if (
+        source_format == RequestFormat.OPENAI_RESPONSES.value
+        and target_format == RequestFormat.ANTHROPIC_MESSAGES.value
+    ):
         return _responses_to_anthropic_body(req, upstream)  # type: ignore[arg-type]
 
     if target_format == RequestFormat.OPENAI_RESPONSES.value:
-        body = _request_to_body(req, source_format, RequestFormat.OPENAI_CHAT_COMPLETIONS.value, upstream)
+        body = _request_to_body(
+            req, source_format, RequestFormat.OPENAI_CHAT_COMPLETIONS.value, upstream
+        )
         response_body = _chat_body_to_responses_body(body)
         response_body["model"] = upstream["upstream_model"]
         return response_body
@@ -435,23 +564,61 @@ def _chat_body_to_responses_body(body: dict) -> dict:
     instructions: str | None = None
     for message in body.get("messages") or []:
         role = message.get("role")
-        if role == "system":
-            instructions = (instructions + "\n\n" if instructions else "") + _extract_text(message.get("content"))
+        if role in ("system", "developer"):
+            instructions = (
+                instructions + "\n\n" if instructions else ""
+            ) + _extract_text(message.get("content"))
             continue
-        input_items.append({
-            "type": "message",
-            "role": role,
-            "content": [{"type": "input_text", "text": _extract_text(message.get("content"))}],
-        })
+        if role == "tool":
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id", ""),
+                    "output": _extract_text(message.get("content")),
+                }
+            )
+            continue
+
+        text = _extract_text(message.get("content"))
+        if text or not message.get("tool_calls"):
+            input_items.append(
+                {
+                    "type": "message",
+                    "role": role,
+                    "content": [{"type": "input_text", "text": text}],
+                }
+            )
+
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function") or {}
+            input_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": tool_call.get("id") or _response_id("call"),
+                    "name": function.get("name", ""),
+                    "arguments": function.get("arguments", "{}"),
+                }
+            )
 
     response_body: dict[str, Any] = {"input": input_items}
     if instructions:
         response_body["instructions"] = instructions
     if body.get("max_tokens") is not None:
         response_body["max_output_tokens"] = body["max_tokens"]
-    for key in ("temperature", "top_p", "stream", "reasoning_effort", "tools", "tool_choice"):
+    for key in (
+        "temperature",
+        "top_p",
+        "stream",
+        "reasoning_effort",
+        "tools",
+        "tool_choice",
+    ):
         if body.get(key) is not None:
-            response_body[key] = [_chat_tool_to_responses(tool) for tool in body[key]] if key == "tools" else body[key]
+            response_body[key] = (
+                [_chat_tool_to_responses(tool) for tool in body[key]]
+                if key == "tools"
+                else body[key]
+            )
     return response_body
 
 
@@ -479,31 +646,57 @@ def _openai_headers(upstream: dict) -> dict:
 
 async def call_anthropic_passthrough(req: ClaudeRequest, upstream: dict) -> dict:
     body = _base_anthropic_body(req, upstream)
-    return await _post_json(f"{upstream['base_url']}/v1/messages", _anthropic_headers(upstream), body)
+    return await _post_json(
+        f"{upstream['base_url']}/v1/messages", _anthropic_headers(upstream), body
+    )
 
 
 async def call_openai_chat_passthrough(req: OpenAIRequest, upstream: dict) -> dict:
     body = _base_chat_body(req, upstream)
-    return await _post_json(f"{upstream['base_url']}/v1/chat/completions", _openai_headers(upstream), body)
+    return await _post_json(
+        f"{upstream['base_url']}/v1/chat/completions", _openai_headers(upstream), body
+    )
 
 
-async def call_openai_responses_passthrough(req: ResponsesRequest, upstream: dict) -> dict:
+async def call_openai_responses_passthrough(
+    req: ResponsesRequest, upstream: dict
+) -> dict:
     body = req.model_dump(exclude_none=True, exclude={"model"})
     body["model"] = upstream["upstream_model"]
-    return await _post_json(f"{upstream['base_url']}/v1/responses", _openai_headers(upstream), body)
+    return await _post_json(
+        f"{upstream['base_url']}/v1/responses", _openai_headers(upstream), body
+    )
 
 
-async def call_with_conversion(req: ClaudeRequest | OpenAIRequest | ResponsesRequest, source_format: str, actual_format: str, upstream: dict) -> dict:
+async def call_with_conversion(
+    req: ClaudeRequest | OpenAIRequest | ResponsesRequest,
+    source_format: str,
+    actual_format: str,
+    upstream: dict,
+) -> dict:
     body = _request_to_body(req, source_format, actual_format, upstream)
     if actual_format == RequestFormat.ANTHROPIC_MESSAGES.value:
-        raw = await _post_json(f"{upstream['base_url']}/v1/messages", _anthropic_headers(upstream), body)
+        raw = await _post_json(
+            f"{upstream['base_url']}/v1/messages", _anthropic_headers(upstream), body
+        )
     elif actual_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
-        raw = await _post_json(f"{upstream['base_url']}/v1/chat/completions", _openai_headers(upstream), body)
+        raw = await _post_json(
+            f"{upstream['base_url']}/v1/chat/completions",
+            _openai_headers(upstream),
+            body,
+        )
     elif actual_format == RequestFormat.OPENAI_RESPONSES.value:
-        raw = await _post_json(f"{upstream['base_url']}/v1/responses", _openai_headers(upstream), body)
+        raw = await _post_json(
+            f"{upstream['base_url']}/v1/responses", _openai_headers(upstream), body
+        )
     else:
         raise ValueError(f"Unsupported upstream format: {actual_format}")
-    return _response_to_format(raw, actual_format, source_format, getattr(req, "model", "") or upstream["upstream_model"])
+    return _response_to_format(
+        raw,
+        actual_format,
+        source_format,
+        getattr(req, "model", "") or upstream["upstream_model"],
+    )
 
 
 def _chat_to_anthropic_response(resp: dict, model: str) -> dict:
@@ -523,7 +716,9 @@ def _chat_to_anthropic_response(resp: dict, model: str) -> dict:
         "stop_sequence": None,
         "usage": {
             "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
-            "output_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
+            "output_tokens": usage.get(
+                "output_tokens", usage.get("completion_tokens", 0)
+            ),
         },
     }
 
@@ -539,15 +734,22 @@ def _anthropic_to_chat_response(resp: dict, model: str) -> dict:
         "object": "chat.completion",
         "created": _now(),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": _stop_reason_to_finish(resp.get("stop_reason")),
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": _stop_reason_to_finish(resp.get("stop_reason")),
+            }
+        ],
         "usage": {
             "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-            "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-            "total_tokens": usage.get("total_tokens", usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
+            "completion_tokens": usage.get(
+                "completion_tokens", usage.get("output_tokens", 0)
+            ),
+            "total_tokens": usage.get(
+                "total_tokens",
+                usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            ),
         },
     }
 
@@ -558,24 +760,37 @@ def _chat_to_responses_response(resp: dict, model: str) -> dict:
     output: list[dict] = []
     content = message.get("content")
     if content:
-        output.append({
-            "id": _response_id("msg"),
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": _extract_text(content), "annotations": []}],
-        })
+        output.append(
+            {
+                "id": _response_id("msg"),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": _extract_text(content),
+                        "annotations": [],
+                    }
+                ],
+            }
+        )
     for tool_call in message.get("tool_calls") or []:
         function = tool_call.get("function") or {}
-        output.append({
-            "id": tool_call.get("id") or _response_id("fc"),
-            "type": "function_call",
-            "status": "completed",
-            "call_id": tool_call.get("id") or _response_id("call"),
-            "name": function.get("name", ""),
-            "arguments": function.get("arguments", "{}"),
-        })
+        call_id = tool_call.get("id") or _response_id("call")
+        output.append(
+            {
+                "id": call_id,
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": function.get("name", ""),
+                "arguments": function.get("arguments", "{}"),
+            }
+        )
     usage = resp.get("usage") or {}
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0))
     return {
         "id": resp.get("id") or _response_id("resp"),
         "object": "response",
@@ -584,9 +799,9 @@ def _chat_to_responses_response(resp: dict, model: str) -> dict:
         "model": model,
         "output": output,
         "usage": {
-            "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
-            "output_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
-            "total_tokens": usage.get("total_tokens", 0),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": usage.get("total_tokens", input_tokens + output_tokens),
         },
     }
 
@@ -602,25 +817,45 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
         if item.get("type") == "message":
             content_parts.append(_extract_text(item.get("content")))
         elif item.get("type") == "function_call":
-            tool_calls.append({
-                "id": item.get("call_id") or item.get("id") or _response_id("call"),
-                "type": "function",
-                "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")},
-            })
-    message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts) or None}
+            tool_calls.append(
+                {
+                    "id": item.get("call_id") or item.get("id") or _response_id("call"),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content_parts) or None,
+    }
     if tool_calls:
         message["tool_calls"] = tool_calls
     usage = resp.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    completion_tokens = usage.get(
+        "completion_tokens", usage.get("output_tokens", 0)
+    )
     return {
         "id": resp.get("id") or _response_id("chatcmpl"),
         "object": "chat.completion",
         "created": int(resp.get("created_at") or _now()),
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
+            }
+        ],
         "usage": {
-            "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-            "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-            "total_tokens": usage.get("total_tokens", 0),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": usage.get(
+                "total_tokens", prompt_tokens + completion_tokens
+            ),
         },
     }
 
@@ -629,48 +864,91 @@ def _responses_to_anthropic_response(resp: dict, model: str) -> dict:
     return _chat_to_anthropic_response(_responses_to_chat_response(resp, model), model)
 
 
-def _response_to_format(resp: dict, actual_format: str, target_format: str, model: str) -> dict:
+def _response_to_format(
+    resp: dict, actual_format: str, target_format: str, model: str
+) -> dict:
     if actual_format == target_format:
         return resp
-    if actual_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value and target_format == RequestFormat.ANTHROPIC_MESSAGES.value:
+    if (
+        actual_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
+        and target_format == RequestFormat.ANTHROPIC_MESSAGES.value
+    ):
         return _chat_to_anthropic_response(resp, model)
-    if actual_format == RequestFormat.ANTHROPIC_MESSAGES.value and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
+    if (
+        actual_format == RequestFormat.ANTHROPIC_MESSAGES.value
+        and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
+    ):
         return _anthropic_to_chat_response(resp, model)
-    if actual_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value and target_format == RequestFormat.OPENAI_RESPONSES.value:
+    if (
+        actual_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
+        and target_format == RequestFormat.OPENAI_RESPONSES.value
+    ):
         return _chat_to_responses_response(resp, model)
-    if actual_format == RequestFormat.ANTHROPIC_MESSAGES.value and target_format == RequestFormat.OPENAI_RESPONSES.value:
+    if (
+        actual_format == RequestFormat.ANTHROPIC_MESSAGES.value
+        and target_format == RequestFormat.OPENAI_RESPONSES.value
+    ):
         return _anthropic_to_responses_response(resp, model)
-    if actual_format == RequestFormat.OPENAI_RESPONSES.value and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
+    if (
+        actual_format == RequestFormat.OPENAI_RESPONSES.value
+        and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
+    ):
         return _responses_to_chat_response(resp, model)
-    if actual_format == RequestFormat.OPENAI_RESPONSES.value and target_format == RequestFormat.ANTHROPIC_MESSAGES.value:
+    if (
+        actual_format == RequestFormat.OPENAI_RESPONSES.value
+        and target_format == RequestFormat.ANTHROPIC_MESSAGES.value
+    ):
         return _responses_to_anthropic_response(resp, model)
-    raise ValueError(f"Unsupported response conversion: {actual_format} -> {target_format}")
+    raise ValueError(
+        f"Unsupported response conversion: {actual_format} -> {target_format}"
+    )
 
 
-async def _stream_lines(url: str, headers: dict, body: dict) -> AsyncGenerator[str, None]:
+async def _stream_lines(
+    url: str, headers: dict, body: dict
+) -> AsyncGenerator[str, None]:
     async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
         async with client.stream("POST", url, headers=headers, json=body) as resp:
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # Read the full error body before raising so that
+                # exc.response.text is available in _format_upstream_error.
+                # Without this, httpx raises ResponseNotRead and the
+                # upstream's error details are silently lost.
+                await resp.aread()
+                resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line:
                     yield line
 
 
-async def stream_anthropic_passthrough(req: ClaudeRequest, upstream: dict) -> AsyncGenerator[str, None]:
+async def stream_anthropic_passthrough(
+    req: ClaudeRequest, upstream: dict
+) -> AsyncGenerator[str, None]:
     body = _base_anthropic_body(req, upstream)
     body["stream"] = True
-    async for line in _stream_lines(f"{upstream['base_url']}/v1/messages", _anthropic_headers(upstream), body):
+    async for line in _stream_lines(
+        f"{upstream['base_url']}/v1/messages", _anthropic_headers(upstream), body
+    ):
         yield line + "\n"
 
 
-async def stream_openai_chat_passthrough(req: OpenAIRequest, upstream: dict) -> AsyncGenerator[str, None]:
+async def stream_openai_chat_passthrough(
+    req: OpenAIRequest, upstream: dict
+) -> AsyncGenerator[str, None]:
     body = _base_chat_body(req, upstream)
     body["stream"] = True
-    async for line in _stream_lines(f"{upstream['base_url']}/v1/chat/completions", _openai_headers(upstream), body):
+    async for line in _stream_lines(
+        f"{upstream['base_url']}/v1/chat/completions", _openai_headers(upstream), body
+    ):
         yield line + "\n"
 
 
-async def stream_with_conversion(req: ClaudeRequest | OpenAIRequest | ResponsesRequest, source_format: str, actual_format: str, upstream: dict) -> AsyncGenerator[str, None]:
+async def stream_with_conversion(
+    req: ClaudeRequest | OpenAIRequest | ResponsesRequest,
+    source_format: str,
+    actual_format: str,
+    upstream: dict,
+) -> AsyncGenerator[str, None]:
     body = _request_to_body(req, source_format, actual_format, upstream)
     body["stream"] = True
     if actual_format == RequestFormat.ANTHROPIC_MESSAGES.value:
@@ -690,11 +968,18 @@ async def stream_with_conversion(req: ClaudeRequest | OpenAIRequest | ResponsesR
             yield line + "\n"
         return
 
-    async for chunk in _convert_stream(_stream_lines(url, headers, body), actual_format, source_format, getattr(req, "model", "") or upstream["upstream_model"]):
+    async for chunk in _convert_stream(
+        _stream_lines(url, headers, body),
+        actual_format,
+        source_format,
+        getattr(req, "model", "") or upstream["upstream_model"],
+    ):
         yield chunk
 
 
-async def _convert_stream(lines: AsyncGenerator[str, None], actual_format: str, target_format: str, model: str) -> AsyncGenerator[str, None]:
+async def _convert_stream(
+    lines: AsyncGenerator[str, None], actual_format: str, target_format: str, model: str
+) -> AsyncGenerator[str, None]:
     if target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
         async for chunk in _stream_to_chat(lines, actual_format, model):
             yield chunk
@@ -720,109 +1005,769 @@ def _parse_sse_data(line: str) -> dict | None:
         return None
 
 
-def _chat_delta_text(event: dict) -> str:
-    return ((event.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
+def _stream_key(index: Any = None, item_id: Any = None) -> str:
+    if item_id is not None:
+        return str(item_id)
+    if index is not None:
+        return str(index)
+    return _response_id("stream")
 
 
-def _anthropic_delta_text(event: dict) -> str:
-    if event.get("type") == "content_block_delta":
-        delta = event.get("delta") or {}
-        if delta.get("type") == "text_delta":
-            return delta.get("text") or ""
-    return ""
+def _stream_finish_to_anthropic(finish_reason: str | None, saw_tool: bool) -> str:
+    if saw_tool:
+        return "tool_use"
+    return _finish_to_stop_reason(finish_reason)
 
 
-def _responses_delta_text(event: dict) -> str:
-    if event.get("type") == "response.output_text.delta":
-        return event.get("delta") or ""
-    return ""
-
-
-def _extract_stream_text(event: dict, actual_format: str) -> str:
+async def _iter_stream_events(
+    lines: AsyncGenerator[str, None], actual_format: str
+) -> AsyncGenerator[dict, None]:
     if actual_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
-        return _chat_delta_text(event)
-    if actual_format == RequestFormat.ANTHROPIC_MESSAGES.value:
-        return _anthropic_delta_text(event)
-    if actual_format == RequestFormat.OPENAI_RESPONSES.value:
-        return _responses_delta_text(event)
-    return ""
+        async for event in _chat_stream_events(lines):
+            yield event
+    elif actual_format == RequestFormat.ANTHROPIC_MESSAGES.value:
+        async for event in _anthropic_stream_events(lines):
+            yield event
+    elif actual_format == RequestFormat.OPENAI_RESPONSES.value:
+        async for event in _responses_stream_events(lines):
+            yield event
 
 
-async def _stream_to_chat(lines: AsyncGenerator[str, None], actual_format: str, model: str) -> AsyncGenerator[str, None]:
-    chunk_id = _response_id("chatcmpl")
+async def _chat_stream_events(
+    lines: AsyncGenerator[str, None],
+) -> AsyncGenerator[dict, None]:
+    tools: dict[str, dict[str, Any]] = {}
+    finish_reason: str | None = None
     async for line in lines:
         event = _parse_sse_data(line)
         if not event:
             continue
         if event.get("__done__"):
             break
-        text = _extract_stream_text(event, actual_format)
-        if text:
+
+        choice = (event.get("choices") or [{}])[0]
+        delta = choice.get("delta") or {}
+        finish_reason = choice.get("finish_reason") or finish_reason
+        content = delta.get("content") or ""
+        if content:
+            yield {"type": "text_delta", "delta": content}
+
+        for tool_call in delta.get("tool_calls") or []:
+            index = tool_call.get("index", 0)
+            key = _stream_key(index)
+            state = tools.setdefault(
+                key,
+                {
+                    "index": index,
+                    "id": tool_call.get("id") or _response_id("call"),
+                    "name": "",
+                    "arguments": "",
+                    "started": False,
+                },
+            )
+            if tool_call.get("id"):
+                state["id"] = tool_call["id"]
+            function = tool_call.get("function") or {}
+            if function.get("name"):
+                state["name"] = function["name"]
+
+            if not state["started"]:
+                state["started"] = True
+                yield {
+                    "type": "tool_start",
+                    "key": key,
+                    "id": state["id"],
+                    "name": state["name"],
+                }
+
+            arguments_delta = function.get("arguments") or ""
+            if arguments_delta:
+                state["arguments"] += arguments_delta
+                yield {
+                    "type": "tool_arguments_delta",
+                    "key": key,
+                    "id": state["id"],
+                    "name": state["name"],
+                    "delta": arguments_delta,
+                }
+
+    for key, state in tools.items():
+        if state.get("started"):
+            yield {
+                "type": "tool_done",
+                "key": key,
+                "id": state["id"],
+                "name": state["name"],
+                "arguments": state["arguments"],
+            }
+    yield {"type": "message_done", "finish_reason": finish_reason}
+
+
+async def _anthropic_stream_events(
+    lines: AsyncGenerator[str, None],
+) -> AsyncGenerator[dict, None]:
+    blocks: dict[int, dict[str, Any]] = {}
+    stop_reason: str | None = None
+    async for line in lines:
+        event = _parse_sse_data(line)
+        if not event:
+            continue
+        event_type = event.get("type")
+        index = event.get("index", 0)
+
+        if event_type == "content_block_start":
+            block = event.get("content_block") or {}
+            block_type = block.get("type")
+            if block_type == "tool_use":
+                key = _stream_key(index)
+                blocks[index] = {
+                    "type": "tool_use",
+                    "key": key,
+                    "id": block.get("id") or _response_id("call"),
+                    "name": block.get("name", ""),
+                    "arguments": "",
+                }
+                yield {
+                    "type": "tool_start",
+                    "key": key,
+                    "id": blocks[index]["id"],
+                    "name": blocks[index]["name"],
+                }
+            else:
+                blocks[index] = {"type": block_type or "text"}
+            continue
+
+        if event_type == "content_block_delta":
+            delta = event.get("delta") or {}
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                text = delta.get("text") or ""
+                if text:
+                    yield {"type": "text_delta", "delta": text}
+            elif delta_type == "input_json_delta":
+                block = blocks.setdefault(
+                    index,
+                    {
+                        "type": "tool_use",
+                        "key": _stream_key(index),
+                        "id": _response_id("call"),
+                        "name": "",
+                        "arguments": "",
+                    },
+                )
+                partial_json = delta.get("partial_json") or ""
+                block["arguments"] += partial_json
+                if partial_json:
+                    yield {
+                        "type": "tool_arguments_delta",
+                        "key": block["key"],
+                        "id": block["id"],
+                        "name": block["name"],
+                        "delta": partial_json,
+                    }
+            continue
+
+        if event_type == "content_block_stop":
+            block = blocks.get(index)
+            if block and block.get("type") == "tool_use":
+                yield {
+                    "type": "tool_done",
+                    "key": block["key"],
+                    "id": block["id"],
+                    "name": block["name"],
+                    "arguments": block["arguments"],
+                }
+            continue
+
+        if event_type == "message_delta":
+            delta = event.get("delta") or {}
+            stop_reason = delta.get("stop_reason") or stop_reason
+            continue
+
+        if event_type == "message_stop":
+            break
+
+    yield {"type": "message_done", "finish_reason": _stop_reason_to_finish(stop_reason)}
+
+
+async def _responses_stream_events(
+    lines: AsyncGenerator[str, None],
+) -> AsyncGenerator[dict, None]:
+    tools: dict[str, dict[str, Any]] = {}
+    async for line in lines:
+        event = _parse_sse_data(line)
+        if not event:
+            continue
+        event_type = event.get("type")
+
+        if event_type == "response.output_text.delta":
+            text = event.get("delta") or ""
+            if text:
+                yield {"type": "text_delta", "delta": text}
+            continue
+
+        if event_type == "response.output_item.added":
+            item = event.get("item") or {}
+            if item.get("type") == "function_call":
+                key = _stream_key(event.get("output_index"), item.get("id"))
+                tools[key] = {
+                    "id": item.get("call_id") or item.get("id") or _response_id("call"),
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments") or "",
+                }
+                yield {
+                    "type": "tool_start",
+                    "key": key,
+                    "id": tools[key]["id"],
+                    "name": tools[key]["name"],
+                }
+            continue
+
+        if event_type == "response.function_call_arguments.delta":
+            key = _stream_key(event.get("output_index"), event.get("item_id"))
+            if key not in tools:
+                tools[key] = {
+                    "id": event.get("item_id") or _response_id("call"),
+                    "name": "",
+                    "arguments": "",
+                    "started": True,
+                    "done": False,
+                }
+                yield {
+                    "type": "tool_start",
+                    "key": key,
+                    "id": tools[key]["id"],
+                    "name": "",
+                }
+            state = tools[key]
+            delta = event.get("delta") or ""
+            state["arguments"] += delta
+            if delta:
+                yield {
+                    "type": "tool_arguments_delta",
+                    "key": key,
+                    "id": state["id"],
+                    "name": state["name"],
+                    "delta": delta,
+                }
+            continue
+
+        if event_type == "response.function_call_arguments.done":
+            key = _stream_key(event.get("output_index"), event.get("item_id"))
+            if key not in tools:
+                tools[key] = {
+                    "id": event.get("item_id") or _response_id("call"),
+                    "name": "",
+                    "arguments": "",
+                    "started": True,
+                    "done": False,
+                }
+                yield {
+                    "type": "tool_start",
+                    "key": key,
+                    "id": tools[key]["id"],
+                    "name": "",
+                }
+            state = tools[key]
+            state["name"] = event.get("name") or state["name"]
+            state["arguments"] = event.get("arguments") or state["arguments"]
+            state["done"] = True
+            yield {
+                "type": "tool_done",
+                "key": key,
+                "id": state["id"],
+                "name": state["name"],
+                "arguments": state["arguments"],
+            }
+            continue
+
+        if event_type == "response.output_item.done":
+            item = event.get("item") or {}
+            if item.get("type") == "function_call":
+                key = _stream_key(event.get("output_index"), item.get("id"))
+                if key not in tools:
+                    tools[key] = {
+                        "id": item.get("call_id") or item.get("id") or _response_id("call"),
+                        "name": item.get("name", ""),
+                        "arguments": "",
+                        "started": True,
+                        "done": False,
+                    }
+                    yield {
+                        "type": "tool_start",
+                        "key": key,
+                        "id": tools[key]["id"],
+                        "name": tools[key]["name"],
+                    }
+                state = tools[key]
+                state["name"] = item.get("name") or state["name"]
+                full_arguments = item.get("arguments") or state["arguments"]
+                if not state.get("done"):
+                    current_arguments = state.get("arguments") or ""
+                    if full_arguments != current_arguments:
+                        delta = (
+                            full_arguments[len(current_arguments):]
+                            if full_arguments.startswith(current_arguments)
+                            else full_arguments
+                        )
+                        if delta:
+                            yield {
+                                "type": "tool_arguments_delta",
+                                "key": key,
+                                "id": state["id"],
+                                "name": state["name"],
+                                "delta": delta,
+                            }
+                    state["arguments"] = full_arguments
+                    state["done"] = True
+                    yield {
+                        "type": "tool_done",
+                        "key": key,
+                        "id": state["id"],
+                        "name": state["name"],
+                        "arguments": state["arguments"],
+                    }
+            continue
+
+        if event_type in ("response.completed", "response.failed", "error"):
+            break
+
+    yield {"type": "message_done", "finish_reason": None}
+
+
+async def _stream_to_chat(
+    lines: AsyncGenerator[str, None], actual_format: str, model: str
+) -> AsyncGenerator[str, None]:
+    chunk_id = _response_id("chatcmpl")
+    tool_indexes: dict[str, int] = {}
+    saw_tool = False
+    finish_reason: str | None = None
+    async for event in _iter_stream_events(lines, actual_format):
+        event_type = event.get("type")
+        if event_type == "message_done":
+            finish_reason = event.get("finish_reason") or finish_reason
+            continue
+        if event_type == "text_delta":
             payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "created": _now(),
                 "model": model,
-                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": event.get("delta") or ""},
+                        "finish_reason": None,
+                    }
+                ],
             }
             yield f"data: {_json_dumps(payload)}\n\n"
+            continue
+
+        if event_type == "tool_start":
+            saw_tool = True
+            key = event.get("key") or event.get("id") or str(len(tool_indexes))
+            tool_index = tool_indexes.setdefault(key, len(tool_indexes))
+            payload = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": _now(),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": tool_index,
+                                    "id": event.get("id") or _response_id("call"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": event.get("name") or "",
+                                        "arguments": "",
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {_json_dumps(payload)}\n\n"
+            continue
+
+        if event_type == "tool_arguments_delta":
+            saw_tool = True
+            key = event.get("key") or event.get("id") or str(len(tool_indexes))
+            tool_index = tool_indexes.setdefault(key, len(tool_indexes))
+            payload = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": _now(),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": tool_index,
+                                    "function": {"arguments": event.get("delta") or ""},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {_json_dumps(payload)}\n\n"
+
+    final_finish = finish_reason or ("tool_calls" if saw_tool else "stop")
     done = {
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "created": _now(),
         "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "delta": {}, "finish_reason": final_finish}],
     }
     yield f"data: {_json_dumps(done)}\n\n"
     yield "data: [DONE]\n\n"
 
 
-async def _stream_to_anthropic(lines: AsyncGenerator[str, None], actual_format: str, model: str) -> AsyncGenerator[str, None]:
+async def _stream_to_anthropic(
+    lines: AsyncGenerator[str, None], actual_format: str, model: str
+) -> AsyncGenerator[str, None]:
     msg_id = _response_id("msg")
-    yield f"event: message_start\ndata: {_json_dumps({'type':'message_start','message':{'id':msg_id,'type':'message','role':'assistant','model':model,'content':[],'stop_reason':None,'stop_sequence':None,'usage':{'input_tokens':0,'output_tokens':0}}})}\n\n"
-    yield f"event: content_block_start\ndata: {_json_dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+    yield f"event: message_start\ndata: {_json_dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+    current_block: str | None = None
+    current_index: int | None = None
+    next_index = 0
     output_tokens = 0
-    async for line in lines:
-        event = _parse_sse_data(line)
-        if not event:
+    saw_tool = False
+    finish_reason: str | None = None
+
+    async def close_current() -> AsyncGenerator[str, None]:
+        nonlocal current_block, current_index
+        if current_block is not None and current_index is not None:
+            yield f"event: content_block_stop\ndata: {_json_dumps({'type': 'content_block_stop', 'index': current_index})}\n\n"
+        current_block = None
+        current_index = None
+
+    async for event in _iter_stream_events(lines, actual_format):
+        event_type = event.get("type")
+        if event_type == "message_done":
+            finish_reason = event.get("finish_reason") or finish_reason
             continue
-        if event.get("__done__"):
-            break
-        text = _extract_stream_text(event, actual_format)
-        if text:
+        if event_type == "text_delta":
+            if current_block != "text":
+                async for chunk in close_current():
+                    yield chunk
+                current_index = next_index
+                next_index += 1
+                current_block = "text"
+                payload = {
+                    "type": "content_block_start",
+                    "index": current_index,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                yield f"event: content_block_start\ndata: {_json_dumps(payload)}\n\n"
             output_tokens += 1
-            payload = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}
+            payload = {
+                "type": "content_block_delta",
+                "index": current_index,
+                "delta": {"type": "text_delta", "text": event.get("delta") or ""},
+            }
             yield f"event: content_block_delta\ndata: {_json_dumps(payload)}\n\n"
-    yield f"event: content_block_stop\ndata: {_json_dumps({'type':'content_block_stop','index':0})}\n\n"
-    yield f"event: message_delta\ndata: {_json_dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':output_tokens}})}\n\n"
-    yield f"event: message_stop\ndata: {_json_dumps({'type':'message_stop'})}\n\n"
+            continue
+
+        if event_type == "tool_start":
+            saw_tool = True
+            async for chunk in close_current():
+                yield chunk
+            current_index = next_index
+            next_index += 1
+            current_block = "tool_use"
+            payload = {
+                "type": "content_block_start",
+                "index": current_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": event.get("id") or _response_id("call"),
+                    "name": event.get("name") or "",
+                    "input": {},
+                },
+            }
+            yield f"event: content_block_start\ndata: {_json_dumps(payload)}\n\n"
+            continue
+
+        if event_type == "tool_arguments_delta":
+            saw_tool = True
+            if current_block != "tool_use":
+                async for chunk in close_current():
+                    yield chunk
+                current_index = next_index
+                next_index += 1
+                current_block = "tool_use"
+                payload = {
+                    "type": "content_block_start",
+                    "index": current_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": event.get("id") or _response_id("call"),
+                        "name": event.get("name") or "",
+                        "input": {},
+                    },
+                }
+                yield f"event: content_block_start\ndata: {_json_dumps(payload)}\n\n"
+            payload = {
+                "type": "content_block_delta",
+                "index": current_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": event.get("delta") or "",
+                },
+            }
+            yield f"event: content_block_delta\ndata: {_json_dumps(payload)}\n\n"
+            continue
+
+        if event_type == "tool_done" and current_block == "tool_use":
+            async for chunk in close_current():
+                yield chunk
+
+    async for chunk in close_current():
+        yield chunk
+    stop_reason = _stream_finish_to_anthropic(finish_reason, saw_tool)
+    yield f"event: message_delta\ndata: {_json_dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+    yield f"event: message_stop\ndata: {_json_dumps({'type': 'message_stop'})}\n\n"
 
 
-async def _stream_to_responses(lines: AsyncGenerator[str, None], actual_format: str, model: str) -> AsyncGenerator[str, None]:
+async def _stream_to_responses(
+    lines: AsyncGenerator[str, None], actual_format: str, model: str
+) -> AsyncGenerator[str, None]:
     resp_id = _response_id("resp")
-    item_id = _response_id("msg")
+    text_item_id = _response_id("msg")
+    text_output_index: int | None = None
+    text_parts: list[str] = []
+    output_items: list[dict] = []
+    tool_items: dict[str, dict[str, Any]] = {}
+    next_output_index = 0
     created = {
         "type": "response.created",
-        "response": {"id": resp_id, "object": "response", "created_at": _now(), "status": "in_progress", "model": model, "output": []},
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "created_at": _now(),
+            "status": "in_progress",
+            "model": model,
+            "output": [],
+        },
     }
     yield f"event: response.created\ndata: {_json_dumps(created)}\n\n"
-    added = {
-        "type": "response.output_item.added",
-        "output_index": 0,
-        "item": {"id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []},
-    }
-    yield f"event: response.output_item.added\ndata: {_json_dumps(added)}\n\n"
-    async for line in lines:
-        event = _parse_sse_data(line)
-        if not event:
+
+    async def ensure_text_item() -> AsyncGenerator[str, None]:
+        nonlocal text_output_index, next_output_index
+        if text_output_index is None:
+            text_output_index = next_output_index
+            next_output_index += 1
+            payload = {
+                "type": "response.output_item.added",
+                "output_index": text_output_index,
+                "item": {
+                    "id": text_item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }
+            yield f"event: response.output_item.added\ndata: {_json_dumps(payload)}\n\n"
+
+    async for event in _iter_stream_events(lines, actual_format):
+        event_type = event.get("type")
+        if event_type == "message_done":
             continue
-        if event.get("__done__"):
-            break
-        text = _extract_stream_text(event, actual_format)
-        if text:
-            payload = {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": text}
+        if event_type == "text_delta":
+            async for chunk in ensure_text_item():
+                yield chunk
+            text = event.get("delta") or ""
+            text_parts.append(text)
+            payload = {
+                "type": "response.output_text.delta",
+                "item_id": text_item_id,
+                "output_index": text_output_index,
+                "content_index": 0,
+                "delta": text,
+            }
             yield f"event: response.output_text.delta\ndata: {_json_dumps(payload)}\n\n"
-    done = {"type": "response.output_item.done", "output_index": 0, "item": {"id": item_id, "type": "message", "status": "completed", "role": "assistant"}}
-    yield f"event: response.output_item.done\ndata: {_json_dumps(done)}\n\n"
-    completed = {"type": "response.completed", "response": {"id": resp_id, "object": "response", "status": "completed", "model": model}}
+            continue
+
+        if event_type == "tool_start":
+            key = event.get("key") or event.get("id") or _response_id("tool")
+            if key not in tool_items:
+                output_index = next_output_index
+                next_output_index += 1
+                item_id = event.get("id") or _response_id("fc")
+                tool_items[key] = {
+                    "id": item_id,
+                    "call_id": event.get("id") or item_id,
+                    "name": event.get("name") or "",
+                    "arguments": "",
+                    "output_index": output_index,
+                    "done": False,
+                }
+                payload = {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "id": item_id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": tool_items[key]["call_id"],
+                        "name": tool_items[key]["name"],
+                        "arguments": "",
+                    },
+                }
+                yield f"event: response.output_item.added\ndata: {_json_dumps(payload)}\n\n"
+            continue
+
+        if event_type == "tool_arguments_delta":
+            key = event.get("key") or event.get("id") or _response_id("tool")
+            if key not in tool_items:
+                output_index = next_output_index
+                next_output_index += 1
+                item_id = event.get("id") or _response_id("fc")
+                tool_items[key] = {
+                    "id": item_id,
+                    "call_id": event.get("id") or item_id,
+                    "name": event.get("name") or "",
+                    "arguments": "",
+                    "output_index": output_index,
+                    "done": False,
+                }
+                payload = {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "id": item_id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": tool_items[key]["call_id"],
+                        "name": tool_items[key]["name"],
+                        "arguments": "",
+                    },
+                }
+                yield f"event: response.output_item.added\ndata: {_json_dumps(payload)}\n\n"
+            state = tool_items[key]
+            delta = event.get("delta") or ""
+            state["arguments"] += delta
+            payload = {
+                "type": "response.function_call_arguments.delta",
+                "item_id": state["id"],
+                "output_index": state["output_index"],
+                "delta": delta,
+            }
+            yield f"event: response.function_call_arguments.delta\ndata: {_json_dumps(payload)}\n\n"
+            continue
+
+        if event_type == "tool_done":
+            key = event.get("key") or event.get("id") or _response_id("tool")
+            if key not in tool_items:
+                output_index = next_output_index
+                next_output_index += 1
+                item_id = event.get("id") or _response_id("fc")
+                tool_items[key] = {
+                    "id": item_id,
+                    "call_id": event.get("id") or item_id,
+                    "name": event.get("name") or "",
+                    "arguments": "",
+                    "output_index": output_index,
+                    "done": False,
+                }
+            state = tool_items[key]
+            state["name"] = event.get("name") or state["name"]
+            state["arguments"] = event.get("arguments") or state["arguments"]
+            done_args = {
+                "type": "response.function_call_arguments.done",
+                "item_id": state["id"],
+                "output_index": state["output_index"],
+                "name": state["name"],
+                "arguments": state["arguments"],
+            }
+            yield f"event: response.function_call_arguments.done\ndata: {_json_dumps(done_args)}\n\n"
+            item = {
+                "id": state["id"],
+                "type": "function_call",
+                "status": "completed",
+                "call_id": state["call_id"],
+                "name": state["name"],
+                "arguments": state["arguments"],
+            }
+            output_items.append(item)
+            payload = {
+                "type": "response.output_item.done",
+                "output_index": state["output_index"],
+                "item": item,
+            }
+            yield f"event: response.output_item.done\ndata: {_json_dumps(payload)}\n\n"
+            state["done"] = True
+
+    if text_output_index is not None:
+        item = {
+            "id": text_item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "".join(text_parts),
+                    "annotations": [],
+                }
+            ],
+        }
+        output_items.insert(0, item)
+        done = {
+            "type": "response.output_item.done",
+            "output_index": text_output_index,
+            "item": item,
+        }
+        yield f"event: response.output_item.done\ndata: {_json_dumps(done)}\n\n"
+
+    for state in tool_items.values():
+        if state.get("done"):
+            continue
+        done_args = {
+            "type": "response.function_call_arguments.done",
+            "item_id": state["id"],
+            "output_index": state["output_index"],
+            "name": state["name"],
+            "arguments": state["arguments"],
+        }
+        yield f"event: response.function_call_arguments.done\ndata: {_json_dumps(done_args)}\n\n"
+        item = {
+            "id": state["id"],
+            "type": "function_call",
+            "status": "completed",
+            "call_id": state["call_id"],
+            "name": state["name"],
+            "arguments": state["arguments"],
+        }
+        output_items.append(item)
+        done = {
+            "type": "response.output_item.done",
+            "output_index": state["output_index"],
+            "item": item,
+        }
+        yield f"event: response.output_item.done\ndata: {_json_dumps(done)}\n\n"
+
+    completed = {
+        "type": "response.completed",
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "status": "completed",
+            "model": model,
+            "output": output_items,
+        },
+    }
     yield f"event: response.completed\ndata: {_json_dumps(completed)}\n\n"
