@@ -33,6 +33,18 @@ def _response_id(prefix: str = "resp") -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def _extract_reasoning_content(item: dict) -> str:
+    reasoning = item.get("reasoning_content") or item.get("reasoning") or ""
+    if reasoning:
+        return str(reasoning)
+
+    parts: list[str] = []
+    for summary in item.get("summary") or []:
+        if isinstance(summary, dict):
+            parts.append(summary.get("text") or "")
+    return "".join(parts)
+
+
 def _extract_text(content: Any) -> str:
     if content is None:
         return ""
@@ -360,29 +372,102 @@ def _anthropic_messages_to_chat(messages: list[Any], system: Any = None) -> list
     return chat_messages
 
 
+def _responses_content_to_chat(content: Any) -> str | list[dict]:
+    """Convert Responses API message content to Chat Completions content.
+
+    - input_text → text
+    - input_image → image_url
+    - other text-like blocks → text
+    If only text blocks are present, returns a plain string.
+    If image blocks are present, returns a content list.
+    When images are present, always includes at least one ``text`` block —
+    some providers (e.g. mimo) reject image-only content lists.
+    """
+    if not isinstance(content, list):
+        return _extract_text(content)
+
+    has_image = False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "input_image":
+            has_image = True
+            break
+
+    if not has_image:
+        return _extract_text(content)
+
+    # Build a content list with both text and image_url parts
+    parts: list[dict] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type in ("text", "input_text", "output_text"):
+            text = block.get("text") or ""
+            parts.append({"type": "text", "text": text})
+        elif block_type == "input_image":
+            # Responses API: {"type": "input_image", "image_url": {"url": "..."} or "data:..."}
+            # Chat Completions:  {"type": "image_url", "image_url": {"url": "..."}}
+            img_url = block.get("image_url")
+            if img_url:
+                # image_url may be a string (data URL) or a dict {"url": "..."}
+                if isinstance(img_url, str):
+                    img_url = {"url": img_url}
+                parts.append({"type": "image_url", "image_url": img_url})
+
+    # Ensure at least one text block exists alongside image_url blocks —
+    # providers like mimo reject content lists that have only image_url entries.
+    has_text = any(p.get("type") == "text" for p in parts if isinstance(p, dict))
+    if not has_text and parts:
+        parts.insert(0, {"type": "text", "text": ""})
+
+    return parts or ""
+
+
 def _responses_input_to_chat_messages(req: ResponsesRequest) -> list[dict]:
     messages: list[dict] = []
+    system_parts: list[str] = []
     if req.instructions:
-        messages.append({"role": "system", "content": req.instructions})
+        system_parts.append(req.instructions)
 
     if isinstance(req.input, str):
         messages.append({"role": "user", "content": req.input})
         return messages
 
+    pending_reasoning = ""
     for item in req.input or []:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
+        if item_type == "reasoning":
+            pending_reasoning += _extract_reasoning_content(item)
+            continue
         if item_type == "message":
             role = item.get("role", "user")
+            if role == "developer":
+                system_parts.append(_extract_text(item.get("content", "")))
+                continue
+            if role not in ("user", "assistant", "system", "tool"):
+                role = "user"
             content = item.get("content", "")
-            messages.append({"role": role, "content": _extract_text(content)})
+            chat_content = _responses_content_to_chat(content)
+            # For assistant messages with no actual text, use None instead of empty string
+            if role == "assistant" and chat_content == "":
+                chat_content = None
+            message = {"role": role, "content": chat_content}
+            if role == "assistant" and pending_reasoning:
+                message["reasoning_content"] = pending_reasoning
+                pending_reasoning = ""
+            messages.append(message)
         elif item_type == "function_call_output":
+            output = item.get("output", "")
+            # output may contain input_image blocks (e.g. from screenshot tools)
+            if isinstance(output, list):
+                output = _responses_content_to_chat(output)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": item.get("call_id") or item.get("id", ""),
-                    "content": item.get("output", ""),
+                    "content": output,
                 }
             )
         elif item_type == "function_call":
@@ -390,6 +475,11 @@ def _responses_input_to_chat_messages(req: ResponsesRequest) -> list[dict]:
                 {
                     "role": "assistant",
                     "content": None,
+                    **(
+                        {"reasoning_content": pending_reasoning}
+                        if pending_reasoning
+                        else {}
+                    ),
                     "tool_calls": [
                         {
                             "id": item.get("call_id")
@@ -404,14 +494,44 @@ def _responses_input_to_chat_messages(req: ResponsesRequest) -> list[dict]:
                     ],
                 }
             )
+            pending_reasoning = ""
+        elif item_type == "input_image":
+            # Top-level input_image item → convert to user message with image_url
+            img_url = item.get("image_url")
+            if img_url:
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": img_url}],
+                })
         else:
+            extracted = _extract_text(item.get("content", item))
             messages.append(
                 {
                     "role": item.get("role", "user"),
-                    "content": _extract_text(item.get("content", item)),
+                    "content": extracted or None,
                 }
             )
+
+    # Prepend accumulated system content (from instructions + developer messages)
+    # at the beginning, since Chat Completions requires system messages first.
+    if system_parts:
+        system_text = "\n\n".join(part for part in system_parts if part)
+        messages.insert(0, {"role": "system", "content": system_text})
+
     return messages
+
+
+def _upstream_requires_reasoning_content(upstream: dict) -> bool:
+    provider = upstream.get("provider_name") or upstream.get("provider") or ""
+    return str(provider).lower() in {"mimo"}
+
+
+def _add_missing_reasoning_content(messages: list[dict], upstream: dict) -> None:
+    if not _upstream_requires_reasoning_content(upstream):
+        return
+    for message in messages:
+        if message.get("role") == "assistant" and "reasoning_content" not in message:
+            message["reasoning_content"] = ""
 
 
 def _base_chat_body(req: OpenAIRequest, upstream: dict) -> dict:
@@ -478,9 +598,11 @@ def _chat_to_anthropic_body(req: OpenAIRequest, upstream: dict) -> dict:
 
 
 def _responses_to_chat_body(req: ResponsesRequest, upstream: dict) -> dict:
+    messages = _responses_input_to_chat_messages(req)
+    _add_missing_reasoning_content(messages, upstream)
     body: dict[str, Any] = {
         "model": upstream["upstream_model"],
-        "messages": _responses_input_to_chat_messages(req),
+        "messages": messages,
     }
     if req.max_output_tokens is not None:
         body["max_tokens"] = req.max_output_tokens
@@ -512,6 +634,63 @@ def _responses_to_anthropic_body(req: ResponsesRequest, upstream: dict) -> dict:
     return _chat_to_anthropic_body(chat_req, upstream)
 
 
+def _normalize_content_for_upstream(body: dict, supports_vision: bool) -> dict:
+    """Normalize message content for upstream compatibility.
+
+    * When ``supports_vision`` is False: strips ``image_url`` blocks (OpenAI format)
+      and ``image`` blocks (Anthropic format) from message content.  If only text
+      blocks remain, collapses content to a plain string.
+
+    * When ``supports_vision`` is True: ensures every message that contains
+      ``image_url`` / ``image`` blocks also has at least one ``text`` block —
+      some providers (e.g. mimo) reject image-only content lists.
+    """
+    messages = body.get("messages") or []
+
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        has_image_url = any(
+            isinstance(b, dict) and b.get("type") == "image_url"
+            for b in content
+        )
+        has_image_anthropic = any(
+            isinstance(b, dict) and b.get("type") == "image"
+            for b in content
+        )
+
+        if not has_image_url and not has_image_anthropic:
+            continue  # No image blocks — nothing to do
+
+        if not supports_vision:
+            # ---- Strip image blocks ----
+            text_blocks = [
+                b for b in content
+                if isinstance(b, dict) and b.get("type") not in ("image_url", "image")
+            ]
+            if not text_blocks:
+                msg["content"] = ""
+            elif all(b.get("type") == "text" for b in text_blocks if isinstance(b, dict)):
+                msg["content"] = "\n".join(
+                    b.get("text", "") for b in text_blocks if isinstance(b, dict)
+                )
+            else:
+                msg["content"] = text_blocks
+        else:
+            # ---- Vision-capable: ensure text block exists ----
+            has_text = any(
+                isinstance(b, dict) and b.get("type") == "text"
+                for b in content
+            )
+            if not has_text:
+                # Insert an empty text block so the provider doesn't reject
+                content.insert(0, {"type": "text", "text": ""})
+
+    return body
+
+
 def _request_to_body(
     req: ClaudeRequest | OpenAIRequest | ResponsesRequest,
     source_format: str,
@@ -519,44 +698,49 @@ def _request_to_body(
     upstream: dict,
 ) -> dict:
     if source_format == target_format == RequestFormat.ANTHROPIC_MESSAGES.value:
-        return _base_anthropic_body(req, upstream)  # type: ignore[arg-type]
-    if source_format == target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
-        return _base_chat_body(req, upstream)  # type: ignore[arg-type]
-    if source_format == target_format == RequestFormat.OPENAI_RESPONSES.value:
+        body = _base_anthropic_body(req, upstream)  # type: ignore[arg-type]
+    elif source_format == target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value:
+        body = _base_chat_body(req, upstream)  # type: ignore[arg-type]
+    elif source_format == target_format == RequestFormat.OPENAI_RESPONSES.value:
         body = req.model_dump(exclude_none=True, exclude={"model"})  # type: ignore[union-attr]
         body["model"] = upstream["upstream_model"]
-        return body
 
-    if (
+    elif (
         source_format == RequestFormat.ANTHROPIC_MESSAGES.value
         and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
     ):
-        return _anthropic_to_chat_body(req, upstream)  # type: ignore[arg-type]
-    if (
+        body = _anthropic_to_chat_body(req, upstream)  # type: ignore[arg-type]
+    elif (
         source_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
         and target_format == RequestFormat.ANTHROPIC_MESSAGES.value
     ):
-        return _chat_to_anthropic_body(req, upstream)  # type: ignore[arg-type]
-    if (
+        body = _chat_to_anthropic_body(req, upstream)  # type: ignore[arg-type]
+    elif (
         source_format == RequestFormat.OPENAI_RESPONSES.value
         and target_format == RequestFormat.OPENAI_CHAT_COMPLETIONS.value
     ):
-        return _responses_to_chat_body(req, upstream)  # type: ignore[arg-type]
-    if (
+        body = _responses_to_chat_body(req, upstream)  # type: ignore[arg-type]
+    elif (
         source_format == RequestFormat.OPENAI_RESPONSES.value
         and target_format == RequestFormat.ANTHROPIC_MESSAGES.value
     ):
-        return _responses_to_anthropic_body(req, upstream)  # type: ignore[arg-type]
+        body = _responses_to_anthropic_body(req, upstream)  # type: ignore[arg-type]
 
-    if target_format == RequestFormat.OPENAI_RESPONSES.value:
+    elif target_format == RequestFormat.OPENAI_RESPONSES.value:
         body = _request_to_body(
             req, source_format, RequestFormat.OPENAI_CHAT_COMPLETIONS.value, upstream
         )
         response_body = _chat_body_to_responses_body(body)
         response_body["model"] = upstream["upstream_model"]
-        return response_body
+        body = response_body
 
-    raise ValueError(f"Unsupported conversion: {source_format} -> {target_format}")
+    else:
+        raise ValueError(f"Unsupported conversion: {source_format} -> {target_format}")
+
+    # Normalize image content for upstream compatibility
+    body = _normalize_content_for_upstream(body, upstream.get("supports_vision", False))
+
+    return body
 
 
 def _chat_body_to_responses_body(body: dict) -> dict:
@@ -578,6 +762,17 @@ def _chat_body_to_responses_body(body: dict) -> dict:
                 }
             )
             continue
+
+        reasoning = message.get("reasoning_content") or message.get("reasoning")
+        if role == "assistant" and reasoning:
+            input_items.append(
+                {
+                    "id": _response_id("rs"),
+                    "type": "reasoning",
+                    "summary": [],
+                    "reasoning_content": str(reasoning),
+                }
+            )
 
         text = _extract_text(message.get("content"))
         if text or not message.get("tool_calls"):
@@ -758,6 +953,17 @@ def _chat_to_responses_response(resp: dict, model: str) -> dict:
     choice = (resp.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     output: list[dict] = []
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    if reasoning:
+        output.append(
+            {
+                "id": _response_id("rs"),
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [],
+                "reasoning_content": str(reasoning),
+            }
+        )
     content = message.get("content")
     if content:
         output.append(
@@ -813,8 +1019,11 @@ def _anthropic_to_responses_response(resp: dict, model: str) -> dict:
 def _responses_to_chat_response(resp: dict, model: str) -> dict:
     content_parts: list[str] = []
     tool_calls: list[dict] = []
+    reasoning_content = ""
     for item in resp.get("output") or []:
-        if item.get("type") == "message":
+        if item.get("type") == "reasoning":
+            reasoning_content += _extract_reasoning_content(item)
+        elif item.get("type") == "message":
             content_parts.append(_extract_text(item.get("content")))
         elif item.get("type") == "function_call":
             tool_calls.append(
@@ -833,6 +1042,8 @@ def _responses_to_chat_response(resp: dict, model: str) -> dict:
     }
     if tool_calls:
         message["tool_calls"] = tool_calls
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     usage = resp.get("usage") or {}
     prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
     completion_tokens = usage.get(

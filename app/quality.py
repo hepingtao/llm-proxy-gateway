@@ -31,42 +31,43 @@ def check_response_quality(
             return False, f"upstream_error: {err_msg[:200]}"
 
     # Extract text and stop_reason based on format
-    text, stop_reason, has_tool_use = _extract(result, request_format)
+    text, stop_reason, has_tool_use, has_thinking = _extract(result, request_format)
 
-    # 2. Empty check (skip if tool_use is present — tool calls are valid output)
-    if quality_config.get("check_empty", True) and not has_tool_use:
+    # 2. Empty check (skip if tool_use or thinking is present)
+    if quality_config.get("check_empty", True) and not has_tool_use and not has_thinking:
         if not text or not text.strip():
             return False, "empty_response"
 
-    # 3. Min length check (skip if tool_use is present)
+    # 3. Min length check (skip if tool_use or thinking is present)
     min_length = quality_config.get("min_response_length", 10)
-    if min_length > 0 and not has_tool_use:
+    if min_length > 0 and not has_tool_use and not has_thinking:
         if len(text.strip()) < min_length:
             return False, f"response_too_short: {len(text.strip())} < {min_length}"
 
-    # 4. Truncation check
-    if quality_config.get("check_truncation", True):
+    # 4. Truncation check (skip if thinking is present — thinking consumes token budget)
+    if quality_config.get("check_truncation", True) and not has_thinking:
         if stop_reason == "max_tokens":
             return False, "truncated_max_tokens"
 
     return True, "ok"
 
 
-def _extract(result: dict, request_format: RequestFormat) -> tuple[str, str, bool]:
-    """Extract (text, stop_reason, has_tool_use) from a response dict."""
+def _extract(result: dict, request_format: RequestFormat) -> tuple[str, str, bool, bool]:
+    """Extract (text, stop_reason, has_tool_use, has_thinking) from a response dict."""
     if request_format == RequestFormat.ANTHROPIC_MESSAGES:
         return _extract_claude(result)
     else:
         return _extract_openai(result)
 
 
-def _extract_claude(result: dict) -> tuple[str, str, bool]:
+def _extract_claude(result: dict) -> tuple[str, str, bool, bool]:
     """Extract from Claude Messages API response."""
     content = result.get("content", [])
     stop_reason = result.get("stop_reason", "")
 
     text_parts = []
     has_tool_use = False
+    has_thinking = False
     for block in content:
         if not isinstance(block, dict):
             continue
@@ -75,11 +76,21 @@ def _extract_claude(result: dict) -> tuple[str, str, bool]:
             text_parts.append(block.get("text", "") or "")
         elif block_type == "tool_use":
             has_tool_use = True
+        elif block_type == "thinking":
+            has_thinking = True
 
-    return "".join(text_parts), stop_reason, has_tool_use
+    text = "".join(text_parts)
+    # If there's thinking but no text, treat thinking as valid output
+    if not text and has_thinking:
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "thinking":
+                text_parts.append(block.get("thinking", "") or "")
+        text = "".join(text_parts)
+
+    return text, stop_reason, has_tool_use, has_thinking
 
 
-def _extract_openai(result: dict) -> tuple[str, str, bool]:
+def _extract_openai(result: dict) -> tuple[str, str, bool, bool]:
     """Extract from OpenAI Chat Completions or Responses API response."""
     # Check if this is a Responses API response (has "output" list)
     output = result.get("output")
@@ -89,7 +100,7 @@ def _extract_openai(result: dict) -> tuple[str, str, bool]:
     # Standard OpenAI Chat Completions
     choices = result.get("choices", [])
     if not choices:
-        return "", "", False
+        return "", "", False, False
 
     choice = choices[0]
     message = choice.get("message", {})
@@ -100,10 +111,13 @@ def _extract_openai(result: dict) -> tuple[str, str, bool]:
     tool_calls = message.get("tool_calls")
     has_tool_use = bool(tool_calls)
 
-    return text, stop_reason, has_tool_use
+    # Check for reasoning_content (thinking) in OpenAI-compatible responses
+    has_thinking = bool(message.get("reasoning_content"))
+
+    return text, stop_reason, has_tool_use, has_thinking
 
 
-def _extract_responses_api(result: dict) -> tuple[str, str, bool]:
+def _extract_responses_api(result: dict) -> tuple[str, str, bool, bool]:
     """Extract from OpenAI Responses API response format."""
     output = result.get("output", [])
     text_parts = []
@@ -124,4 +138,4 @@ def _extract_responses_api(result: dict) -> tuple[str, str, bool]:
     # If it completed, we treat it as non-truncated
     stop_reason = result.get("stop_reason", "stop")
 
-    return "".join(text_parts), stop_reason, has_tool_use
+    return "".join(text_parts), stop_reason, has_tool_use, False

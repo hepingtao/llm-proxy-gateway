@@ -164,6 +164,7 @@ class ModelConfig:
             "base_url": base_url,
             "api_version": cfg.get("api_version", ""),
             "reasoning_effort": cfg.get("reasoning_effort"),
+            "supports_vision": cfg.get("supports_vision", False),
         }
 
     # Format fallback priority: openai-chat-completions > anthropic-messages > openai-responses
