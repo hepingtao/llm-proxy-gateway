@@ -80,6 +80,10 @@ aliases:
       - model: deepseek/deepseek-v4-flash
       - model: deepseek/deepseek-v4-pro
       - model: vllm/Qwen3.6-Coder
+    # Fallback when client (e.g., Codex CLI) does not send max_output_tokens.
+    # Without this, upstream OpenAI-compatible providers apply their own (low)
+    # server-side defaults, causing responses to be cut off mid-sentence.
+    default_max_output_tokens: 16384
     quality_checks:
       min_response_length: 10
       check_empty: true
@@ -93,6 +97,7 @@ aliases:
       - model: deepseek/deepseek-v4-flash
       - model: deepseek/deepseek-v4-pro
       - model: vllm/Qwen3.6-Coder
+    default_max_output_tokens: 16384
     quality_checks:
       min_response_length: 10
       check_empty: true
@@ -106,6 +111,7 @@ aliases:
       - model: deepseek/deepseek-v4-flash # cloud cheap
       - model: deepseek/deepseek-v4-pro # cloud most capable
       - model: vllm/Qwen3.6-Coder # primary — local, fast
+    default_max_output_tokens: 16384
     quality_checks:
       min_response_length: 10
       check_empty: true

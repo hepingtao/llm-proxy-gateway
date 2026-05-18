@@ -604,8 +604,13 @@ def _responses_to_chat_body(req: ResponsesRequest, upstream: dict) -> dict:
         "model": upstream["upstream_model"],
         "messages": messages,
     }
+    # Resolve max_tokens with priority: client > alias default > none.
+    # Without an explicit value, OpenAI-compatible upstreams apply their own
+    # (often low) server-side default and truncate Codex CLI responses.
     if req.max_output_tokens is not None:
         body["max_tokens"] = req.max_output_tokens
+    elif upstream.get("default_max_output_tokens") is not None:
+        body["max_tokens"] = upstream["default_max_output_tokens"]
     if req.temperature is not None:
         body["temperature"] = req.temperature
     if req.top_p is not None:
@@ -759,6 +764,13 @@ def _request_to_body(
     elif source_format == target_format == RequestFormat.OPENAI_RESPONSES.value:
         body = req.model_dump(exclude_none=True, exclude={"model"})  # type: ignore[union-attr]
         body["model"] = upstream["upstream_model"]
+        # Apply alias-level default_max_output_tokens when the client omits it,
+        # to avoid premature truncation by the upstream's own server default.
+        if (
+            "max_output_tokens" not in body
+            and upstream.get("default_max_output_tokens") is not None
+        ):
+            body["max_output_tokens"] = upstream["default_max_output_tokens"]
 
     elif (
         source_format == RequestFormat.ANTHROPIC_MESSAGES.value

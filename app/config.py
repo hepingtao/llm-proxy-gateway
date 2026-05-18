@@ -200,12 +200,19 @@ class ModelConfig:
         if not alias_cfg or "cascade" not in alias_cfg:
             raise ValueError(f"No '{alias_name}' cascade configuration found in config.yaml")
 
+        # Alias-level default for max_output_tokens (used when the client
+        # request omits max_tokens / max_output_tokens). Injected into each
+        # upstream dict so request-conversion code can pick it up.
+        alias_default_max_tokens = alias_cfg.get("default_max_output_tokens")
+
         upstream_list = []
         for entry in alias_cfg["cascade"]:
             model_name = entry["model"]
             try:
                 upstream = self.get_upstream_info(model_name, request_format)
                 upstream["_cascade_model_name"] = model_name
+                if alias_default_max_tokens is not None:
+                    upstream["default_max_output_tokens"] = alias_default_max_tokens
                 upstream_list.append(upstream)
             except ValueError as e:
                 print(f"[config] WARNING: Skipping cascade model '{model_name}': {e}")
