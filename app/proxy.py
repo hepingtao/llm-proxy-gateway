@@ -634,6 +634,54 @@ def _responses_to_anthropic_body(req: ResponsesRequest, upstream: dict) -> dict:
     return _chat_to_anthropic_body(chat_req, upstream)
 
 
+def _request_has_images(req: ClaudeRequest | OpenAIRequest | ResponsesRequest, source_format: str) -> bool:
+    """Check whether a request contains image content.
+
+    Detects ``image_url`` (OpenAI), ``input_image`` (Responses), and ``image``
+    (Anthropic) blocks inside message content.
+    """
+    # Collect all content payloads to scan
+    contents: list[Any] = []
+
+    if isinstance(req, ResponsesRequest):
+        inp = req.input
+        if isinstance(inp, str):
+            return False
+        for item in inp or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "input_image":
+                return True
+            if item_type == "message":
+                contents.append(item.get("content"))
+            elif item_type == "function_call_output":
+                output = item.get("output")
+                if isinstance(output, list):
+                    for block in output:
+                        if isinstance(block, dict) and block.get("type") == "input_image":
+                            return True
+    elif isinstance(req, OpenAIRequest):
+        for msg in req.messages or []:
+            contents.append(msg.content if hasattr(msg, "content") else msg.get("content"))
+    elif isinstance(req, ClaudeRequest):
+        for msg in req.messages or []:
+            contents.append(msg.content if hasattr(msg, "content") else msg.get("content"))
+        if req.system:
+            contents.append(req.system)
+
+    for content in contents:
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in ("image_url", "input_image", "image"):
+                return True
+
+    return False
+
+
 def _normalize_content_for_upstream(body: dict, supports_vision: bool) -> dict:
     """Normalize message content for upstream compatibility.
 
@@ -670,6 +718,13 @@ def _normalize_content_for_upstream(body: dict, supports_vision: bool) -> dict:
                 b for b in content
                 if isinstance(b, dict) and b.get("type") not in ("image_url", "image")
             ]
+            img_count = len(content) - len(text_blocks)
+            if img_count > 0:
+                print(
+                    f"[proxy] STRIP {img_count} image block(s) from message "
+                    f"(upstream does not support vision)",
+                    flush=True,
+                )
             if not text_blocks:
                 msg["content"] = ""
             elif all(b.get("type") == "text" for b in text_blocks if isinstance(b, dict)):

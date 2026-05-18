@@ -23,6 +23,7 @@ from .proxy import (
     stream_anthropic_passthrough,
     stream_openai_chat_passthrough,
     stream_with_conversion,
+    _request_has_images,
 )
 from .quality import check_response_quality
 
@@ -119,6 +120,24 @@ def _format_config_error(
             "error": {
                 "type": "unsupported_model_or_format",
                 "message": str(exc),
+                "model": model_name,
+                "request_format": request_format.value,
+            }
+        },
+    )
+
+
+def _format_vision_not_supported(
+    model_name: str, request_format: RequestFormat
+) -> JSONResponse:
+    """Return 400 error when request has images but upstream model doesn't support vision."""
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "type": "vision_not_supported",
+                "message": f"Model '{model_name}' does not support image/vision inputs. "
+                           f"Please use a model that supports vision.",
                 "model": model_name,
                 "request_format": request_format.value,
             }
@@ -279,6 +298,9 @@ async def _cascade_non_stream(
     last_error = None
     attempted_models = []
 
+    has_images = None  # Lazy-computed: True/False once checked, None = not yet
+    all_skipped_no_vision = True  # Track if ALL skips were vision-related
+
     for idx, upstream in enumerate(cascade_list):
         elapsed = time.monotonic() - start_time
         if elapsed >= max_total_timeout:
@@ -290,6 +312,22 @@ async def _cascade_non_stream(
 
         cascade_model = upstream["_cascade_model_name"]
         actual_format = upstream["actual_format"]
+
+        # Skip non-vision models when request contains images
+        if not upstream.get("supports_vision", False):
+            if has_images is None:
+                has_images = _request_has_images(req, request_format.value)
+            if has_images:
+                attempted_models.append(f"{cascade_model} ({actual_format})")
+                print(
+                    f"[{datetime.now(_CST).strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"[cascade] SKIP {cascade_model}: no vision support, request has images",
+                    flush=True,
+                )
+                last_error = f"no vision support for {cascade_model}"
+                continue
+
+        all_skipped_no_vision = False  # At least one model was attempted
         attempted_models.append(f"{cascade_model} ({actual_format})")
         remaining_timeout = max_total_timeout - elapsed
 
@@ -329,6 +367,17 @@ async def _cascade_non_stream(
                               attempt_conv_id, {"cascade_quality_fail": reason, "result_preview": str(result)[:500]})
             continue
 
+    # All cascade models failed
+    if has_images and all_skipped_no_vision:
+        return JSONResponse(status_code=400, content={"error": {
+            "type": "vision_not_supported",
+            "message": f"No model in cascade '{alias_name}' supports image/vision inputs. "
+                       f"Attempted models: {', '.join(attempted_models)}",
+            "model": alias_name,
+            "request_format": request_format.value,
+            "attempted_models": attempted_models,
+        }}), None
+
     return JSONResponse(status_code=502, content={"error": {
         "type": "cascade_exhausted",
         "message": f"All cascade models failed. Last error: {last_error}",
@@ -367,10 +416,33 @@ async def create_chat_completion(req: OpenAIRequest, request: Request):
             async def event_stream():
                 last_error = None
                 last_error_payload = None
+                has_images = None  # Lazy-computed
+                all_skipped_no_vision = True  # Track if ALL skips were vision-related
 
                 for idx, upstream in enumerate(cascade_list):
                     cascade_model = upstream["_cascade_model_name"]
                     actual_format = upstream["actual_format"]
+
+                    # Skip non-vision models when request contains images
+                    if not upstream.get("supports_vision", False):
+                        if has_images is None:
+                            has_images = _request_has_images(req, request_format.value)
+                        if has_images:
+                            if idx > 0:
+                                _print_cascade_req2(upstream)
+                            print(
+                                f"[{datetime.now(_CST).strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"[cascade] SKIP {cascade_model}: no vision support, request has images",
+                                flush=True,
+                            )
+                            last_error = f"no vision support for {cascade_model}"
+                            _, last_error_payload = _format_upstream_error(
+                                Exception(f"no vision support for {cascade_model}"),
+                                cascade_model, upstream, str(request.url), request_format,
+                            )
+                            continue
+
+                    all_skipped_no_vision = False  # At least one model was attempted
 
                     # Print REQ-2 for cascade attempts (first one already printed before entering generator)
                     if idx > 0:
@@ -462,7 +534,15 @@ async def create_chat_completion(req: OpenAIRequest, request: Request):
                     f"[{datetime.now(_CST).strftime('%Y-%m-%d %H:%M:%S')}] [cascade] ALL MODELS FAILED for {cascade_alias}: {last_error}",
                     flush=True,
                 )
-                yield f"data: {json.dumps({'error': last_error_payload['error']})}\n\n"
+                if has_images and all_skipped_no_vision:
+                    vision_error = {
+                        "type": "vision_not_supported",
+                        "message": f"No model in cascade '{cascade_alias}' supports image/vision inputs.",
+                        "model": cascade_alias,
+                    }
+                    yield f"data: {json.dumps({'error': vision_error})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'error': last_error_payload['error']})}\n\n"
                 yield "data: [DONE]\n\n"
 
             resp = StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -510,6 +590,10 @@ async def create_chat_completion(req: OpenAIRequest, request: Request):
         )
     except ValueError as e:
         return _format_config_error(e, model_name, request_format)
+
+    # Reject if request has images but upstream doesn't support vision
+    if not upstream.get("supports_vision", False) and _request_has_images(req, request_format.value):
+        return _format_vision_not_supported(model_name, request_format)
 
     actual_format = upstream["actual_format"]
     client_id = request.client.host if request.client else "unknown"
@@ -623,10 +707,33 @@ async def create_response(req: ResponsesRequest, request: Request):
             async def event_stream():
                 last_error = None
                 last_error_payload = None
+                has_images = None  # Lazy-computed
+                all_skipped_no_vision = True  # Track if ALL skips were vision-related
 
                 for idx, upstream in enumerate(cascade_list):
                     cascade_model = upstream["_cascade_model_name"]
                     actual_format = upstream["actual_format"]
+
+                    # Skip non-vision models when request contains images
+                    if not upstream.get("supports_vision", False):
+                        if has_images is None:
+                            has_images = _request_has_images(req, request_format.value)
+                        if has_images:
+                            if idx > 0:
+                                _print_cascade_req2(upstream)
+                            print(
+                                f"[{datetime.now(_CST).strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"[cascade] SKIP {cascade_model}: no vision support, request has images",
+                                flush=True,
+                            )
+                            last_error = f"no vision support for {cascade_model}"
+                            _, last_error_payload = _format_upstream_error(
+                                Exception(f"no vision support for {cascade_model}"),
+                                cascade_model, upstream, str(request.url), request_format,
+                            )
+                            continue
+
+                    all_skipped_no_vision = False  # At least one model was attempted
 
                     # Print REQ-2 for cascade attempts (first one already printed before entering generator)
                     if idx > 0:
@@ -703,7 +810,15 @@ async def create_response(req: ResponsesRequest, request: Request):
                     f"[{datetime.now(_CST).strftime('%Y-%m-%d %H:%M:%S')}] [cascade] ALL MODELS FAILED for {cascade_alias}: {last_error}",
                     flush=True,
                 )
-                yield f"event: response.failed\ndata: {json.dumps({'type': 'response.failed', 'response': {'status': 'failed', 'error': last_error_payload['error']}})}\n\n"
+                if has_images and all_skipped_no_vision:
+                    vision_error = {
+                        "type": "vision_not_supported",
+                        "message": f"No model in cascade '{cascade_alias}' supports image/vision inputs.",
+                        "model": cascade_alias,
+                    }
+                    yield f"event: response.failed\ndata: {json.dumps({'type': 'response.failed', 'response': {'status': 'failed', 'error': vision_error}})}\n\n"
+                else:
+                    yield f"event: response.failed\ndata: {json.dumps({'type': 'response.failed', 'response': {'status': 'failed', 'error': last_error_payload['error']}})}\n\n"
 
             resp = StreamingResponse(event_stream(), media_type="text/event-stream")
             # Note: header reflects the first cascade model; actual model info flows in SSE events
@@ -760,6 +875,10 @@ async def create_response(req: ResponsesRequest, request: Request):
         )
     except ValueError as e:
         return _format_config_error(e, model_name, request_format)
+
+    # Reject if request has images but upstream doesn't support vision
+    if not upstream.get("supports_vision", False) and _request_has_images(req, request_format.value):
+        return _format_vision_not_supported(model_name, request_format)
 
     actual_format = upstream["actual_format"]
     client_id = request.client.host if request.client else "unknown"
